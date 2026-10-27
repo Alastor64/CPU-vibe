@@ -11,10 +11,6 @@ class StudentTop(config: CpuConfig = CpuConfig()) extends Module {
   override def desiredName: String = "student_top"
   override def resetType = Module.ResetType.Synchronous
 
-  // The configuration is fixed at elaboration time. Later commits connect the
-  // frontend, ROB, rename tables, issue queues, and execution units here.
-  private val issueWidth: Int = config.issueWidth
-
   val araddr  = IO(Output(UInt(32.W)))
   val arvalid = IO(Output(Bool()))
   val arready = IO(Input(Bool()))
@@ -37,15 +33,32 @@ class StudentTop(config: CpuConfig = CpuConfig()) extends Module {
   val bvalid  = IO(Input(Bool()))
   val bready  = IO(Output(Bool()))
 
-  // The first build establishes the interface and generation flow. No bus
-  // transaction is issued until the real fetch/memory pipeline is connected.
-  araddr  := 0.U
-  arvalid := false.B
-  rready  := false.B
-  awaddr  := 0.U
-  awvalid := false.B
-  wdata   := 0.U
-  wstrb   := 0.U
-  wvalid  := false.B
-  bready  := false.B
+  val core = Module(new Core(config))
+  val memory = Module(new MemorySubsystem(config))
+
+  core.iReq <> memory.iReq
+  core.iResp := memory.iResp
+  core.dLoadReq <> memory.dLoadReq
+  core.dLoadResp := memory.dLoadResp
+  core.dStoreReq <> memory.dStoreReq
+  core.dStoreResp := memory.dStoreResp
+  dontTouch(core.halted)
+
+  araddr := memory.araddr
+  arvalid := memory.arvalid
+  memory.arready := arready
+  memory.rdata := rdata
+  memory.rvalid := rvalid
+  rready := memory.rready
+
+  awaddr := memory.awaddr
+  awvalid := memory.awvalid
+  memory.awready := awready
+  wdata := memory.wdata
+  wstrb := memory.wstrb
+  wvalid := memory.wvalid
+  memory.wready := wready
+  memory.bresp := bresp
+  memory.bvalid := bvalid
+  bready := memory.bready
 }
