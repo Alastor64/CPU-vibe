@@ -1,0 +1,25 @@
+# JVM, Scala and Chisel build products
+/target/
+/project/target/
+/project/project/
+/out/
+/.bsp/
+/.bloop/
+/.metals/
+
+# Local Verilog exports
+/generated/
+/verilog/generated/
+
+# Simulation and synthesis artifacts
+/build/
+*.vcd
+*.fst
+*.o
+*.a
+/code
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+.DS_Store
