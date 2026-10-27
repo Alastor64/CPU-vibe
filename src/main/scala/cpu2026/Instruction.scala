@@ -70,6 +70,8 @@ class Decoded extends Bundle {
   val branchOp = UInt(3.W)
   val isJal    = Bool()
   val isJalr   = Bool()
+  val predictTaken = Bool()
+  val predictTarget = UInt(32.W)
   val isLoad   = Bool()
   val isStore  = Bool()
   val memFunct3 = UInt(3.W)
@@ -97,6 +99,8 @@ object Decoded {
     decoded.branchOp := BranchOp.equal
     decoded.isJal := false.B
     decoded.isJalr := false.B
+    decoded.predictTaken := false.B
+    decoded.predictTarget := 0.U
     decoded.isLoad := false.B
     decoded.isStore := false.B
     decoded.memFunct3 := 0.U
@@ -161,6 +165,8 @@ class Decoder extends Module {
       decoded.illegal := false.B
       decoded.imm := ImmGen.j(in)
       decoded.isJal := true.B
+      decoded.predictTaken := true.B
+      decoded.predictTarget := pc + ImmGen.j(in)
       decoded.op1Sel := Op1Sel.pc
       decoded.op2Sel := Op2Sel.four
     }
@@ -178,6 +184,8 @@ class Decoder extends Module {
       decoded.rd := 0.U
       decoded.imm := ImmGen.b(in)
       decoded.isBranch := true.B
+      decoded.predictTaken := ImmGen.b(in).asSInt < 0.S
+      decoded.predictTarget := pc + ImmGen.b(in)
       decoded.op1Sel := Op1Sel.rs1
       decoded.op2Sel := Op2Sel.rs2
       decoded.branchOp := MuxLookup(funct3, BranchOp.equal)(

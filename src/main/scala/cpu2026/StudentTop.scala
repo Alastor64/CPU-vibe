@@ -36,8 +36,10 @@ class StudentTop(config: CpuConfig = CpuConfig()) extends Module {
   val core = Module(new Core(config))
   val memory = Module(new MemorySubsystem(config))
 
-  core.iReq <> memory.iReq
-  core.iResp := memory.iResp
+  memory.iPc := core.iPc
+  core.iInstrs := memory.iInstrs
+  core.iCount := memory.iCount
+  memory.iFlush := core.iFlush
   core.dLoadReq <> memory.dLoadReq
   core.dLoadResp := memory.dLoadResp
   core.dStoreReq <> memory.dStoreReq

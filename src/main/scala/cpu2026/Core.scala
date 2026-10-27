@@ -6,6 +6,8 @@ import chisel3.util._
 class FetchEntry extends Bundle {
   val pc    = UInt(32.W)
   val instr = UInt(32.W)
+  val predictTaken = Bool()
+  val predictTarget = UInt(32.W)
 }
 
 class RobEntry(physBits: Int) extends Bundle {
@@ -26,8 +28,8 @@ class RobEntry(physBits: Int) extends Bundle {
 }
 
 /** Tomasulo core with speculative physical-register renaming and in-order ROB
-  * commit. Branches are predicted not-taken; taken controls redirect from the
-  * execute stage and restore the branch's rename snapshot.
+  * commit. A static/BTB frontend predicts control flow; unresolved or wrong
+  * predictions redirect from execute and restore the branch snapshot.
   */
 class Core(config: CpuConfig) extends Module {
   private val debugTrace = sys.env.get("CPU_DEBUG").contains("1")
@@ -41,8 +43,10 @@ class Core(config: CpuConfig) extends Module {
   require(config.physicalRegisters <= (1 << physBits))
   require(config.robEntries <= (1 << robBits))
 
-  val iReq = IO(Decoupled(UInt(32.W)))
-  val iResp = IO(Input(Valid(UInt(32.W))))
+  val iPc = IO(Output(UInt(32.W)))
+  val iInstrs = IO(Input(Vec(width, UInt(32.W))))
+  val iCount = IO(Input(UInt(dispatchCountBits.W)))
+  val iFlush = IO(Output(Bool()))
   val dLoadReq = IO(Decoupled(UInt(32.W)))
   val dLoadResp = IO(Input(Valid(UInt(32.W))))
   val dStoreReq = IO(Decoupled(new StoreRequest))
@@ -54,18 +58,26 @@ class Core(config: CpuConfig) extends Module {
   // Front end
   // -----------------------------------------------------------------------
   val fetchPc = RegInit(0.U(32.W))
-  val fetchInFlight = RegInit(false.B)
-  val dropFetchResponse = RegInit(false.B)
   val fetchQueue = Reg(Vec(fetchDepth, new FetchEntry))
   val fetchQueueCount = RegInit(0.U(fetchCountBits.W))
+  val btbValid = RegInit(VecInit(Seq.fill(64)(false.B)))
+  val btbTaken = Reg(Vec(64, Bool()))
+  val btbTarget = Reg(Vec(64, UInt(32.W)))
+  val returnStack = Reg(Vec(16, UInt(32.W)))
+  val returnStackCount = RegInit(0.U(5.W))
 
   val decoders = Seq.fill(width)(Module(new Decoder))
+  val fetchDecoders = Seq.fill(width)(Module(new Decoder))
   val decoded = Wire(Vec(width, new Decoded))
   for (lane <- 0 until width) {
     val validSlot = lane.U < fetchQueueCount
     decoders(lane).pc := Mux(validSlot, fetchQueue(lane).pc, 0.U)
     decoders(lane).in := Mux(validSlot, fetchQueue(lane).instr, 0.U)
     decoded(lane) := decoders(lane).out
+    decoded(lane).predictTaken :=
+      Mux(validSlot, fetchQueue(lane).predictTaken, false.B)
+    decoded(lane).predictTarget :=
+      Mux(validSlot, fetchQueue(lane).predictTarget, 0.U)
   }
 
   val prefetchCount = Mux(fetchQueueCount >= width.U, width.U, fetchQueueCount)
@@ -74,7 +86,7 @@ class Core(config: CpuConfig) extends Module {
   })
   val candidateCount = Mux(
     controlSlots.asUInt.orR,
-    PriorityEncoder(controlSlots) + 1.U,
+    PriorityEncoder(controlSlots).pad(dispatchCountBits) + 1.U,
     prefetchCount
   )
   val slotValid = VecInit((0 until width).map(lane => lane.U < candidateCount))
@@ -110,9 +122,9 @@ class Core(config: CpuConfig) extends Module {
     val available = freePhysical.asUInt & ~allocationUsed
     val phys = PriorityEncoder(available)
     newPhysical(lane) := Mux(needsPhysical(lane), phys, 0.U)
-    when(needsPhysical(lane)) {
-      allocationUsed = allocationUsed | UIntToOH(phys, config.physicalRegisters)
-    }
+    allocationUsed =
+      allocationUsed |
+        Mux(needsPhysical(lane), UIntToOH(phys, config.physicalRegisters), 0.U)
   }
   val enoughPhysical = PopCount(freePhysical) >= physicalNeedCount
 
@@ -177,12 +189,12 @@ class Core(config: CpuConfig) extends Module {
         slotValid(previous) && decoded(previous).writesRd &&
           decoded(previous).rd === rs2
       })
-    val rs1EarlierPhys =
-      if (lane == 0) 0.U
-      else Mux1H(rs1Earlier, VecInit((0 until lane).map(newPhysical)))
-    val rs2EarlierPhys =
-      if (lane == 0) 0.U
-      else Mux1H(rs2Earlier, VecInit((0 until lane).map(newPhysical)))
+    val rs1EarlierPhys = (0 until lane).foldLeft(before(rs1)) { (selected, previous) =>
+      Mux(rs1Earlier(previous), newPhysical(previous), selected)
+    }
+    val rs2EarlierPhys = (0 until lane).foldLeft(before(rs2)) { (selected, previous) =>
+      Mux(rs2Earlier(previous), newPhysical(previous), selected)
+    }
     val ps1 = Mux(rs1Earlier.asUInt.orR, rs1EarlierPhys, before(rs1))
     val ps2 = Mux(rs2Earlier.asUInt.orR, rs2EarlierPhys, before(rs2))
     val ready1 = Mux(rs1Earlier.asUInt.orR, false.B, ps1 === 0.U || physicalReady(ps1))
@@ -245,12 +257,20 @@ class Core(config: CpuConfig) extends Module {
   }
 
   val redirectLanes = VecInit((0 until width).map { lane =>
-    issueQueue.issue(lane).valid && alus(lane).redirect
+    val entry = issueQueue.issue(lane).bits
+    val dec = entry.decoded
+    issueQueue.issue(lane).valid && dec.isControl &&
+      (alus(lane).branchTaken =/= dec.predictTaken ||
+        (alus(lane).branchTaken && alus(lane).target =/= dec.predictTarget))
   })
   val redirectNow = redirectLanes.asUInt.orR
   val redirectLane = PriorityEncoder(redirectLanes)
   val redirectSequence = issueQueue.issue(redirectLane).bits.seq
-  val redirectTarget = VecInit(alus.map(_.target))(redirectLane)
+  val redirectTarget = Mux(
+    VecInit(alus.map(_.branchTaken))(redirectLane),
+    VecInit(alus.map(_.target))(redirectLane),
+    issueQueue.issue(redirectLane).bits.decoded.pc + 4.U
+  )
   val redirectRobIndex = issueQueue.issue(redirectLane).bits.robIndex
 
   for (lane <- 0 until width) {
@@ -308,6 +328,17 @@ class Core(config: CpuConfig) extends Module {
     writeback(lane).bits.branchTarget := alus(lane).target
     writeback(lane).bits.storeData := storeData
     writeback(lane).bits.storeStrobe := storeStrobe
+
+    when(issueQueue.issue(lane).valid && dec.isControl) {
+      val btbIndex = dec.pc(7, 2)
+      btbValid(btbIndex) := true.B
+      btbTaken(btbIndex) := alus(lane).branchTaken
+      btbTarget(btbIndex) := Mux(
+        alus(lane).branchTaken,
+        alus(lane).target,
+        dec.pc + 4.U
+      )
+    }
   }
 
   val selectedLoad = VecInit((0 until width).map { lane =>
@@ -378,14 +409,15 @@ class Core(config: CpuConfig) extends Module {
   val debugCycle = RegInit(0.U(10.W))
   debugCycle := debugCycle + 1.U
 
+  val exitStore = headEntry.result === "h80000000".U &&
+    headEntry.storeStrobe === "hf".U
   dStoreReq.valid := !redirectNow && !haltedReg && !storeCommitActive &&
     !storeResponsePending && headIsStore
   dStoreReq.bits.addr := headEntry.result & "hfffffffc".U
   dStoreReq.bits.data := headEntry.storeData
   dStoreReq.bits.strobe := headEntry.storeStrobe
+  dStoreReq.bits.isExit := exitStore
 
-  val exitStore = headEntry.result === "h80000000".U &&
-    headEntry.storeStrobe === "hf".U
   when(dStoreReq.fire) {
     storeCommitActive := true.B
     storeExit := exitStore
@@ -556,8 +588,74 @@ class Core(config: CpuConfig) extends Module {
   // -----------------------------------------------------------------------
   // Fetch queue movement and PC redirection
   // -----------------------------------------------------------------------
+  val fetched = Wire(Vec(width, new Decoded))
+  val fetchPredTaken = Wire(Vec(width, Bool()))
+  val fetchPredTarget = Wire(Vec(width, UInt(32.W)))
+  for (lane <- 0 until width) {
+    val lanePc = fetchPc + (lane * 4).U
+    fetchDecoders(lane).pc := lanePc
+    fetchDecoders(lane).in := iInstrs(lane)
+    fetched(lane) := fetchDecoders(lane).out
+
+    val btbIndex = lanePc(7, 2)
+    val isReturn = fetched(lane).isJalr && fetched(lane).rd === 0.U &&
+      fetched(lane).rs1 === 1.U && fetched(lane).imm === 0.U
+    fetchPredTaken(lane) := fetched(lane).isControl && Mux(
+      isReturn,
+      returnStackCount =/= 0.U,
+      Mux(btbValid(btbIndex), btbTaken(btbIndex), fetched(lane).predictTaken)
+    )
+    fetchPredTarget(lane) := Mux(
+      isReturn,
+      Mux(
+        returnStackCount === 0.U,
+        0.U,
+        returnStack((returnStackCount - 1.U)(3, 0))
+      ),
+      Mux(btbValid(btbIndex), btbTarget(btbIndex), fetched(lane).predictTarget)
+    )
+  }
+
   val dequeueCount = Mux(dispatchAllowed, candidateCount, 0.U)
-  val fetchResponseAccept = iResp.valid && !dropFetchResponse && !redirectNow
+  val fetchAvailable = VecInit((0 until width).map { lane =>
+    lane.U < iCount
+  })
+  val fetchControls = VecInit((0 until width).map { lane =>
+    fetchAvailable(lane) && fetched(lane).isControl
+  })
+  val uncappedFetchCount = Mux(
+    fetchControls.asUInt.orR,
+    PriorityEncoder(fetchControls).pad(dispatchCountBits) + 1.U,
+    iCount
+  )
+  val availableSlots = fetchDepth.U - fetchQueueCount
+  val acceptedCount = Mux(
+    redirectNow,
+    0.U,
+    Mux(
+      uncappedFetchCount <= availableSlots,
+      uncappedFetchCount,
+      availableSlots(dispatchCountBits - 1, 0)
+    )
+  )
+  val acceptedLanes = VecInit((0 until width).map { lane =>
+    lane.U < acceptedCount
+  })
+  val acceptedControl = VecInit((0 until width).map { lane =>
+    acceptedLanes(lane) && fetched(lane).isControl
+  })
+  val acceptedControlLane = PriorityEncoder(acceptedControl)
+  val acceptedControlValid = acceptedControl.asUInt.orR
+  val acceptedIsReturn = acceptedControlValid &&
+    fetched(acceptedControlLane).isJalr && fetched(acceptedControlLane).rd === 0.U &&
+    fetched(acceptedControlLane).rs1 === 1.U &&
+    fetched(acceptedControlLane).imm === 0.U
+  val acceptedIsCall = acceptedControlValid &&
+    (fetched(acceptedControlLane).isJal || fetched(acceptedControlLane).isJalr) &&
+    fetched(acceptedControlLane).rd =/= 0.U
+  val acceptedPredTaken = acceptedControlValid &&
+    fetchPredTaken(acceptedControlLane)
+
   val retainedFetch = Mux(redirectNow, 0.U, fetchQueueCount - dequeueCount)
   for (index <- 0 until fetchDepth) {
     when(!redirectNow && index.U >= dequeueCount && index.U < fetchQueueCount) {
@@ -565,35 +663,45 @@ class Core(config: CpuConfig) extends Module {
         fetchQueue(index)
     }
   }
-  when(fetchResponseAccept) {
-    fetchQueue(retainedFetch(log2Ceil(fetchDepth) - 1, 0)) := {
-      val entry = Wire(new FetchEntry)
-      entry.pc := fetchPc
-      entry.instr := iResp.bits
-      entry
-    }
-    if (debugTrace) {
-      printf(p"FETCH pc=${fetchPc} instr=${iResp.bits}\n")
+  for (lane <- 0 until width) {
+    when(!redirectNow && acceptedLanes(lane)) {
+      fetchQueue((retainedFetch + lane.U)(log2Ceil(fetchDepth) - 1, 0)) := {
+        val entry = Wire(new FetchEntry)
+        entry.pc := fetchPc + (lane * 4).U
+        entry.instr := iInstrs(lane)
+        entry.predictTaken := fetchPredTaken(lane)
+        entry.predictTarget := fetchPredTarget(lane)
+        entry
+      }
+      if (debugTrace) {
+        printf(
+          p"FETCH pc=${fetchPc + (lane * 4).U} instr=${iInstrs(lane)} " +
+            p"taken=${fetchPredTaken(lane)} target=${fetchPredTarget(lane)}\n"
+        )
+      }
     }
   }
-  fetchQueueCount := retainedFetch + Mux(fetchResponseAccept, 1.U, 0.U)
+  fetchQueueCount := retainedFetch + acceptedCount
 
-  iReq.valid := !fetchInFlight && !haltedReg && fetchQueueCount < fetchDepth.U &&
-    !dropFetchResponse && !redirectNow
-  iReq.bits := fetchPc
-  when(iReq.fire) {
-    fetchInFlight := true.B
+  when(acceptedIsCall && returnStackCount < 16.U) {
+    val callPc = fetchPc + acceptedControlLane * 4.U
+    returnStack(returnStackCount(3, 0)) := callPc + 4.U
+    returnStackCount := returnStackCount + 1.U
   }
-  when(iResp.valid) {
-    fetchInFlight := false.B
-    dropFetchResponse := false.B
+  when(acceptedIsReturn && returnStackCount =/= 0.U) {
+    returnStackCount := returnStackCount - 1.U
   }
 
   when(redirectNow) {
     fetchPc := redirectTarget
-    dropFetchResponse := fetchInFlight && !iResp.valid
-    fetchInFlight := Mux(iResp.valid, false.B, fetchInFlight)
-  }.elsewhen(fetchResponseAccept) {
-    fetchPc := fetchPc + 4.U
+  }.elsewhen(acceptedCount =/= 0.U) {
+    fetchPc := Mux(
+      acceptedPredTaken,
+      fetchPredTarget(acceptedControlLane),
+      fetchPc + (acceptedCount << 2)
+    )
   }
+
+  iPc := fetchPc
+  iFlush := redirectNow
 }

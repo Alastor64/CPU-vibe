@@ -37,13 +37,30 @@ Chisel 是硬件设计的唯一事实来源。不要在 `CPU-submit` 中手工�
 
 ```sh
 make compile
-make generate
+make generate ISSUE_WIDTH=4
 make lint
 ```
 
 `make generate` 将单文件 SystemVerilog 输出到
 `../CPU-submit/verilog/generated/student_top.sv`。构建命令固定使用当前已缓存的
 Scala/Chisel 依赖并设置离线模式，避免无意更新依赖。
+
+默认配置为 4 发射、16 项 ROB、64 个物理寄存器、8 项发射队列、4 KiB I-Cache
+和 4 KiB 两路 D-Cache。所有参数均可从 Make 覆盖：
+
+```sh
+make generate ISSUE_WIDTH=2 ROB_DEPTH=32 PHYSICAL_REGISTERS=96 \
+  ISSUE_QUEUE_DEPTH=16 ICACHE_BYTES=8192 DCACHE_BYTES=16384 \
+  CACHE_WAYS=2 CACHE_LINE_BYTES=64
+```
+
+## 当前实现状态
+
+- 官方正确性测试：19/19 通过。
+- 官方性能测试：6/6 能正确退出。
+- 1、2、4 发射均已完成 Chisel elaboration 和 Verilator 编译。
+- 当前组合逻辑乘法、除法，以及由寄存器阵列实现的 Cache 仍会显著增加面积；
+  Cache 的 `sram_fakeram` 化和多端口数据访问是下一阶段优化重点。
 
 ## 验证约定
 

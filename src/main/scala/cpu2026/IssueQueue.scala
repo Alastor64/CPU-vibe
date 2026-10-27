@@ -125,10 +125,8 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
     issue(lane).bits :=
       Mux(found, entries(index), 0.U.asTypeOf(new IssueEntry(physBits, robBits)))
 
-    when(found) {
-      memorySelected = memorySelected || memoryMask(index)
-      controlSelected = controlSelected || controlMask(index)
-    }
+    memorySelected = memorySelected || (found && memoryMask(index))
+    controlSelected = controlSelected || (found && controlMask(index))
     selectedMask = selectedMask | chosen
   }
 
@@ -184,10 +182,12 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
 
   private var enqueueOffset = survivorCount
   for (lane <- 0 until issueWidth) {
-    when(enqueueEnabled && enqValid(lane)) {
-      next(enqueueOffset(log2Ceil(depth) - 1, 0)) := resolvedEnqueue(lane)
-      enqueueOffset = enqueueOffset + 1.U
+    val append = enqueueEnabled && enqValid(lane)
+    val appendIndex = enqueueOffset(log2Ceil(depth) - 1, 0)
+    when(append) {
+      next(appendIndex) := resolvedEnqueue(lane)
     }
+    enqueueOffset = enqueueOffset + append.asUInt
   }
 
   entries := next

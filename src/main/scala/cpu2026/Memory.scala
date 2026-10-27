@@ -7,6 +7,12 @@ class StoreRequest extends Bundle {
   val addr  = UInt(32.W)
   val data  = UInt(32.W)
   val strobe = UInt(4.W)
+  val isExit = Bool()
+}
+
+class WriteResponse extends Bundle {
+  val bresp = UInt(2.W)
+  val isExit = Bool()
 }
 
 /** Serial AXI4-Lite read engine shared by the instruction and data caches.
@@ -75,7 +81,8 @@ class AxiReadArbiter extends Module {
 /** Serial AXI4-Lite write engine used for committed stores. */
 class AxiWriteEngine extends Module {
   val req     = IO(Flipped(Decoupled(new StoreRequest)))
-  val resp    = IO(Valid(UInt(2.W)))
+  val resp    = IO(Valid(new WriteResponse))
+  val idle    = IO(Output(Bool()))
 
   val awaddr  = IO(Output(UInt(32.W)))
   val awvalid = IO(Output(Bool()))
@@ -88,43 +95,45 @@ class AxiWriteEngine extends Module {
   val bvalid  = IO(Input(Bool()))
   val bready  = IO(Output(Bool()))
 
-  private val idle :: issue :: response :: Nil = Enum(3)
-  val state = RegInit(idle)
+  private val idleState :: issueState :: responseState :: Nil = Enum(3)
+  val state = RegInit(idleState)
   val request = Reg(new StoreRequest)
   val awDone = RegInit(false.B)
   val wDone = RegInit(false.B)
 
-  req.ready := state === idle
-  resp := 0.U.asTypeOf(Valid(UInt(2.W)))
+  req.ready := state === idleState
+  resp := 0.U.asTypeOf(Valid(new WriteResponse))
+  idle := state === idleState
 
   awaddr := request.addr
-  awvalid := state === issue && !awDone
+  awvalid := state === issueState && !awDone
   wdata := request.data
   wstrb := request.strobe
-  wvalid := state === issue && !wDone
-  bready := state === response
+  wvalid := state === issueState && !wDone
+  bready := state === responseState
 
   switch(state) {
-    is(idle) {
+    is(idleState) {
       when(req.fire) {
         request := req.bits
         awDone := false.B
         wDone := false.B
-        state := issue
+        state := issueState
       }
     }
-    is(issue) {
+    is(issueState) {
       when(awvalid && awready) { awDone := true.B }
       when(wvalid && wready) { wDone := true.B }
       when((awDone || (awvalid && awready)) && (wDone || (wvalid && wready))) {
-        state := response
+        state := responseState
       }
     }
-    is(response) {
+    is(responseState) {
       when(bvalid) {
         resp.valid := true.B
-        resp.bits := bresp
-        state := idle
+        resp.bits.bresp := bresp
+        resp.bits.isExit := request.isExit
+        state := idleState
       }
     }
   }
@@ -136,11 +145,14 @@ class CacheLine(tagWidth: Int, lineWords: Int) extends Bundle {
   val data  = Vec(lineWords, UInt(32.W))
 }
 
-class InstructionCache(config: CpuConfig) extends Module {
+class InstructionCache(config: CpuConfig, fetchWidth: Int) extends Module {
   require(config.cacheLineBytes % 4 == 0)
+  require(fetchWidth >= 1 && fetchWidth <= 4)
 
-  val req  = IO(Flipped(Decoupled(UInt(32.W))))
-  val resp = IO(Valid(UInt(32.W)))
+  val pc = IO(Input(UInt(32.W)))
+  val instrs = IO(Output(Vec(fetchWidth, UInt(32.W))))
+  val count = IO(Output(UInt(log2Ceil(fetchWidth + 1).W)))
+  val flush = IO(Input(Bool()))
 
   val memReq  = IO(Decoupled(UInt(32.W)))
   val memResp = IO(Input(Valid(UInt(32.W))))
@@ -163,54 +175,67 @@ class InstructionCache(config: CpuConfig) extends Module {
   val fillSet = Reg(UInt(indexBits.W))
   val fillWay = Reg(UInt(log2Ceil(ways).W))
   val fillWord = Reg(UInt(log2Ceil(lineWords).W))
-  val requestedIndex = Reg(UInt(log2Ceil(lineWords).W))
-  val requestedData = Reg(UInt(32.W))
-  val responseValid = RegInit(false.B)
-  val responseData = Reg(UInt(32.W))
 
-  req.ready := state === idle && !responseValid
-  resp := 0.U.asTypeOf(Valid(UInt(32.W)))
-
-  private val request = req.bits
-  private val setIndex = (request >> offsetBits)(indexBits - 1, 0)
-  private val tag = if (tagBits == 0) 0.U else request >> (offsetBits + indexBits)
-  private val wordIndex = (request >> 2)(log2Ceil(lineWords) - 1, 0)
-  private val hitVec = VecInit((0 until ways).map { way =>
-    valid(setIndex)(way) && lines(setIndex)(way).tag === tag
+  private val requestAddrs = VecInit((0 until fetchWidth).map { lane =>
+    pc + (lane * 4).U
   })
-  private val hit = hitVec.asUInt.orR
-  private val hitWay = OHToUInt(hitVec)
-  private val hitData = Mux1H(hitVec, VecInit((0 until ways).map { way =>
-    lines(setIndex)(way).data(wordIndex)
-  }))
+  private val setIndexes = VecInit(requestAddrs.map { address =>
+    (address >> offsetBits)(indexBits - 1, 0)
+  })
+  private val tags = VecInit(requestAddrs.map { address =>
+    if (tagBits == 0) 0.U else address >> (offsetBits + indexBits)
+  })
+  private val wordIndexes = VecInit(requestAddrs.map { address =>
+    (address >> 2)(log2Ceil(lineWords) - 1, 0)
+  })
+  private val hitVectors = VecInit((0 until fetchWidth).map { lane =>
+    VecInit((0 until ways).map { way =>
+      valid(setIndexes(lane))(way) && lines(setIndexes(lane))(way).tag === tags(lane)
+    })
+  })
+  private val laneHits = VecInit(hitVectors.map(_.asUInt.orR))
+  private val laneData = VecInit((0 until fetchWidth).map { lane =>
+    Mux1H(
+      hitVectors(lane),
+      VecInit((0 until ways).map { way =>
+        lines(setIndexes(lane))(way).data(wordIndexes(lane))
+      })
+    )
+  })
+  private val prefixHits = VecInit((0 until fetchWidth).map { lane =>
+    (0 to lane).map(index => laneHits(index)).reduce(_ && _)
+  })
+  private val validLanes = Mux(
+    state === idle,
+    prefixHits,
+    VecInit(Seq.fill(fetchWidth)(false.B))
+  )
+  count := PopCount(validLanes)
+  instrs := laneData
 
-  private val emptyVec = VecInit((0 until ways).map(way => !valid(setIndex)(way)))
+  private val missLanes = VecInit((0 until fetchWidth).map(lane => !laneHits(lane)))
+  private val firstMiss = PriorityEncoder(missLanes)
+  private val firstMissAddress = requestAddrs(firstMiss)
+  private val lineBase = Cat(firstMissAddress(31, offsetBits), 0.U(offsetBits.W))
+  private val emptyVec = VecInit((0 until ways).map { way =>
+    !valid(setIndexes(firstMiss))(way)
+  })
   private val victim = Mux(emptyVec.asUInt.orR, PriorityEncoder(emptyVec), 0.U)
-  private val lineBase = Cat(request(31, offsetBits), 0.U(offsetBits.W))
 
   memReq.valid := state === fillAddrState
   memReq.bits := fillAddress
 
-  when(responseValid) {
-    responseValid := false.B
+  when(flush) {
+    state := idle
   }
 
-  resp.valid := responseValid
-  resp.bits := responseData
-
-  when(req.fire) {
-    when(hit) {
-      responseValid := true.B
-      responseData := hitData
-    }.otherwise {
-      fillAddress := lineBase
-      fillTag := tag
-      fillSet := setIndex
-      fillWay := victim
-      fillWord := 0.U
-      requestedIndex := wordIndex
-      state := fillAddrState
-    }
+  when(state === idle && missLanes.asUInt.orR) {
+    fillAddress := lineBase
+    fillTag := tags(firstMiss)
+    fillSet := setIndexes(firstMiss)
+    fillWay := victim
+    fillWord := 0.U
+    state := fillAddrState
   }
 
   when(state === fillAddrState && memReq.ready) {
@@ -219,14 +244,9 @@ class InstructionCache(config: CpuConfig) extends Module {
 
   when(state === fillDataState && memResp.valid) {
     lines(fillSet)(fillWay).data(fillWord) := memResp.bits
-    when(fillWord === requestedIndex) {
-      requestedData := memResp.bits
-    }
     when(fillWord === (lineWords - 1).U) {
       lines(fillSet)(fillWay).tag := fillTag
       valid(fillSet)(fillWay) := true.B
-      responseValid := true.B
-      responseData := Mux(fillWord === requestedIndex, memResp.bits, requestedData)
       state := idle
     }.otherwise {
       fillAddress := fillAddress + 4.U
@@ -247,7 +267,8 @@ class DataCache(config: CpuConfig) extends Module {
   val memReq  = IO(Decoupled(UInt(32.W)))
   val memResp = IO(Input(Valid(UInt(32.W))))
   val writeReq  = IO(Decoupled(new StoreRequest))
-  val writeResp = IO(Input(Valid(UInt(2.W))))
+  val writeResp = IO(Input(Valid(new WriteResponse)))
+  val writeIdle = IO(Input(Bool()))
 
   private val lineWords = config.cacheLineBytes / 4
   private val sets = config.dcacheBytes / (config.cacheLineBytes * config.cacheWays)
@@ -260,7 +281,7 @@ class DataCache(config: CpuConfig) extends Module {
   val lines = Reg(Vec(sets, Vec(ways, new CacheLine(tagBits, lineWords))))
   val valid = RegInit(VecInit(Seq.fill(sets)(VecInit(Seq.fill(ways)(false.B)))))
 
-  private val idle :: fillAddrState :: fillDataState :: write :: writeWait :: Nil = Enum(5)
+  private val idle :: fillAddrState :: fillDataState :: fillDrain :: Nil = Enum(4)
   val state = RegInit(idle)
   val fillAddress = Reg(UInt(32.W))
   val fillTag = Reg(UInt(tagBits.W))
@@ -272,12 +293,13 @@ class DataCache(config: CpuConfig) extends Module {
   val loadResponseValid = RegInit(false.B)
   val loadResponseData = Reg(UInt(32.W))
   val storeResponse = RegInit(0.U.asTypeOf(Valid(UInt(2.W))))
-  val pendingStore = Reg(new StoreRequest)
+  val writeQueue = Module(new Queue(new StoreRequest, 8))
 
   // Loads have priority so the core can decide whether to issue a memory uop
   // without creating a valid/ready path through a pending committed store.
   loadReq.ready := state === idle && !loadResponseValid
-  storeReq.ready := state === idle && !loadReq.valid && !loadResponseValid
+  storeReq.ready := state === idle && !loadReq.valid && !loadResponseValid &&
+    writeQueue.io.enq.ready
   loadResp := 0.U.asTypeOf(Valid(UInt(32.W)))
   storeResp := storeResponse
 
@@ -304,8 +326,11 @@ class DataCache(config: CpuConfig) extends Module {
 
   memReq.valid := state === fillAddrState
   memReq.bits := fillAddress
-  writeReq.valid := state === write
-  writeReq.bits := pendingStore
+  writeQueue.io.enq.valid := storeReq.fire
+  writeQueue.io.enq.bits := storeReq.bits
+  writeReq.valid := writeQueue.io.deq.valid
+  writeReq.bits := writeQueue.io.deq.bits
+  writeQueue.io.deq.ready := writeReq.ready
 
   when(loadResponseValid) {
     loadResponseValid := false.B
@@ -330,8 +355,16 @@ class DataCache(config: CpuConfig) extends Module {
       fillWay := victim
       fillWord := 0.U
       requestedIndex := loadWord
-      state := fillAddrState
+      state := Mux(
+        writeQueue.io.count === 0.U && writeIdle,
+        fillAddrState,
+        fillDrain
+      )
     }
+  }
+
+  when(state === fillDrain && writeQueue.io.count === 0.U && writeIdle) {
+    state := fillAddrState
   }
 
   when(state === fillAddrState && memReq.ready) {
@@ -357,7 +390,6 @@ class DataCache(config: CpuConfig) extends Module {
   }
 
   when(storeReq.fire) {
-    pendingStore := storeReq.bits
     when(storeHitVec.asUInt.orR) {
       for (way <- 0 until ways) {
         when(storeHitVec(way)) {
@@ -373,23 +405,23 @@ class DataCache(config: CpuConfig) extends Module {
         }
       }
     }
-    state := write
+    when(!storeReq.bits.isExit) {
+      storeResponse.valid := true.B
+      storeResponse.bits := 0.U
+    }
   }
 
-  when(state === write && writeReq.ready) {
-    state := writeWait
-  }
-
-  when(state === writeWait && writeResp.valid) {
+  when(writeResp.valid && writeResp.bits.isExit) {
     storeResponse.valid := true.B
-    storeResponse.bits := writeResp.bits
-    state := idle
+    storeResponse.bits := writeResp.bits.bresp
   }
 }
 
 class MemorySubsystem(config: CpuConfig) extends Module {
-  val iReq  = IO(Flipped(Decoupled(UInt(32.W))))
-  val iResp = IO(Valid(UInt(32.W)))
+  val iPc = IO(Input(UInt(32.W)))
+  val iInstrs = IO(Output(Vec(config.issueWidth, UInt(32.W))))
+  val iCount = IO(Output(UInt(log2Ceil(config.issueWidth + 1).W)))
+  val iFlush = IO(Input(Bool()))
   val dLoadReq  = IO(Flipped(Decoupled(UInt(32.W))))
   val dLoadResp = IO(Valid(UInt(32.W)))
   val dStoreReq  = IO(Flipped(Decoupled(new StoreRequest)))
@@ -413,13 +445,15 @@ class MemorySubsystem(config: CpuConfig) extends Module {
   val bvalid  = IO(Input(Bool()))
   val bready  = IO(Output(Bool()))
 
-  val icache = Module(new InstructionCache(config))
+  val icache = Module(new InstructionCache(config, config.issueWidth))
   val dcache = Module(new DataCache(config))
   val reads = Module(new AxiReadArbiter)
   val writes = Module(new AxiWriteEngine)
 
-  iReq <> icache.req
-  iResp := icache.resp
+  icache.pc := iPc
+  iInstrs := icache.instrs
+  iCount := icache.count
+  icache.flush := iFlush
   dLoadReq <> dcache.loadReq
   dLoadResp := dcache.loadResp
   dStoreReq <> dcache.storeReq
@@ -432,6 +466,7 @@ class MemorySubsystem(config: CpuConfig) extends Module {
 
   writes.req <> dcache.writeReq
   dcache.writeResp := writes.resp
+  dcache.writeIdle := writes.idle
 
   araddr := reads.araddr
   arvalid := reads.arvalid
