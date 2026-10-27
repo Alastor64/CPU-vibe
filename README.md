@@ -31,8 +31,19 @@ Chisel 是硬件设计的唯一事实来源。不要在 `CPU-submit` 中手工�
 /mnt/d/CPU-vibe/cpu2026-tools-x86_64.AppImage
 ```
 
-课程 AppImage 已包含 Verilator、Yosys、ABC 和 OpenSTA；Chisel 生成流程需要独立安装
-Chisel 构建工具。所有 Git 操作使用 WSL 中的 `git`。
+课程 AppImage 已包含 Verilator、Yosys、ABC 和 OpenSTA。Chisel 工程直接使用 WSL 中
+现有的 `scala-cli`、Chisel 和 firtool，不依赖助教 Mill 模板。所有 Git 操作使用 WSL
+中的 `git`。
+
+```sh
+make compile
+make generate
+make lint
+```
+
+`make generate` 将单文件 SystemVerilog 输出到
+`../CPU-submit/verilog/generated/student_top.sv`。构建命令固定使用当前已缓存的
+Scala/Chisel 依赖并设置离线模式，避免无意更新依赖。
 
 ## 验证约定
 
