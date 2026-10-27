@@ -28,7 +28,8 @@ object Generate {
         "--lowering-options=disallowLocalVariables,disallowPackedArrays"
       )
     )
-    Files.writeString(output, systemVerilog, StandardCharsets.UTF_8)
+    // Keep generated files stable under `git diff --check` and repeated builds.
+    Files.writeString(output, systemVerilog.stripTrailing() + "\n", StandardCharsets.UTF_8)
     println(s"Generated $output")
   }
 }
