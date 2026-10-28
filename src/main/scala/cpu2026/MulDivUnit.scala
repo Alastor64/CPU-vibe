@@ -5,9 +5,9 @@ import chisel3.util._
 
 /** Shared M-extension unit.
   *
-  * Multiplication has a fixed latency of two cycles and one operation per
-  * cycle is accepted. Division/remainder uses a radix-2 restoring divider and
-  * takes 34 cycles from acceptance to writeback.
+  * Multiplication uses a two-stage Wallace-tree multiplier. Division/remainder
+  * uses a radix-2 restoring divider and takes 34 cycles from acceptance to
+  * writeback.
   */
 class MulDivUnit extends Module {
   val start = IO(Input(Bool()))
@@ -37,16 +37,21 @@ class MulDivUnit extends Module {
     op === AluOp.mulhsu || op === AluOp.mulhu
   val isSignedDiv = op === AluOp.div || op === AluOp.rem
 
-  // One unsigned array is sufficient for every RV32M multiply:
+  val multiplier = Module(new PipelinedWallaceMultiplier)
+  multiplier.start := start && isMul
+  multiplier.a := a
+  multiplier.b := b
+
+  // One unsigned product is sufficient for every RV32M multiply:
   // low 32 bits are sign-agnostic, and signed high halves are corrected by
   // subtracting the other operand when either source sign bit is set.
-  private val unsignedProduct = a * b
+  private val unsignedProduct = multiplier.product
   private val unsignedHigh = unsignedProduct(63, 32)
   private val signedSignedHigh =
-    unsignedHigh - Mux(a(31), b, 0.U) - Mux(b(31), a, 0.U)
+    unsignedHigh - Mux(aReg(31), bReg, 0.U) - Mux(bReg(31), aReg, 0.U)
   private val signedUnsignedHigh =
-    unsignedHigh - Mux(a(31), b, 0.U)
-  val multiplyValue = MuxLookup(op, 0.U)(
+    unsignedHigh - Mux(aReg(31), bReg, 0.U)
+  val multiplyValue = MuxLookup(opReg, 0.U)(
     Seq(
       AluOp.mul -> unsignedProduct(31, 0),
       AluOp.mulh -> signedSignedHigh,
@@ -62,9 +67,9 @@ class MulDivUnit extends Module {
   val unsignedQuotient = nextQuotient
   val unsignedRemainder = nextRemainder
 
-  busy := state =/= idle
+  busy := state =/= idle || multiplier.busy
   done := state === mulDone || state === divDone
-  value := resultReg
+  value := Mux(state === mulDone, multiplyValue, resultReg)
 
   switch(state) {
     is(idle) {
@@ -73,7 +78,6 @@ class MulDivUnit extends Module {
         aReg := a
         bReg := b
         when(isMul) {
-          resultReg := multiplyValue
           state := mulDone
         }.otherwise {
           val signed = isSignedDiv

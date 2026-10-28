@@ -61,7 +61,8 @@ make generate ISSUE_WIDTH=2 ROB_DEPTH=32 PHYSICAL_REGISTERS=96 \
 - 1、2、4 发射均已完成 Chisel elaboration 和 Verilator 编译。
 - I/D Cache 的行存储均已迁移到 `sram_fakeram`。多端口数据访问仍是下一阶段优化重点。
 - 四个执行通道共享一个 M 扩展单元：乘法固定 2 拍，除法/取余 radix-2 迭代 34 拍。
-- 乘法只生成一套无符号 32×32 阵列；`MULH/MULHSU` 通过 32 位符号修正得到高位。
+- 乘法按两个 16 位 limb 生成 2×2 部分积，第一拍用 Wallace 树压缩为 sum/carry，
+  第二拍完成 64 位最终加法；`MULH/MULHSU` 通过 32 位符号修正得到高位。
 
 ## 验证约定
 
