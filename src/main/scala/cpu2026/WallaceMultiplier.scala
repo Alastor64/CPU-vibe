@@ -2,13 +2,14 @@ package cpu2026
 
 import chisel3._
 import chisel3.util._
+import scala.collection.mutable.ArrayBuffer
 
-/** Two-stage unsigned 32x32 multiplier.
+/** Two-stage unsigned 32x32 standard Wallace-tree multiplier.
   *
-  * Stage one splits both operands into 16-bit limbs, forms the four products of
-  * the 2x2 limb convolution, aligns them to a 64-bit product, and reduces the
-  * four rows with 3:2 Wallace-tree compressors. Stage two performs the single
-  * wide addition of the registered sum/carry pair.
+  * Stage one forms the complete bit-level convolution `a[i] & b[j]`, aligns
+  * every term by its weight `2^(i+j)`, and reduces all terms in each column
+  * with a levelized 3:2 compressor tree. Stage two adds the two registered
+  * result rows.
   *
   * The module accepts one operation when `start` is asserted in `Idle`.
   * `product` is a 64-bit unsigned result and `done` is asserted for one cycle
@@ -28,43 +29,71 @@ class PipelinedWallaceMultiplier extends Module {
   val sumReg   = RegInit(0.U(64.W))
   val carryReg = RegInit(0.U(64.W))
 
-  /** Compress three equally weighted rows into a sum row and one carry row.
-    *
-    * The majority term is the carry generated at each bit position. Shifting
-    * it left once gives the carry row's weight. The final product is below
-    * 2^64, so discarding the compressor's 65th bit is exact modulo the product
-    * width and keeps every row in a uniform 64-bit format.
-    */
-  private def compress3(x: UInt, y: UInt, z: UInt): (UInt, UInt) = {
-    val sumRow = Wire(UInt(64.W))
-    val carryRow = Wire(UInt(64.W))
-    sumRow := x ^ y ^ z
-    carryRow := ((x & y) | (x & z) | (y & z)) << 1
-    (sumRow, carryRow)
+  /** A Wallace full adder consumes three bits of equal weight. */
+  private def fullAdder(x: Bool, y: Bool, z: Bool): (Bool, Bool) = {
+    val sum = x ^ y ^ z
+    val carry = (x & y) | (x & z) | (y & z)
+    (sum, carry)
   }
 
-  // A 32-bit operand is interpreted as {high limb, low limb}. Computing all
-  // four limb pairs is the 2x2 convolution needed by the full product:
-  //
-  //   product = low*low + (low*high + high*low) << 16 + high*high << 32
-  private val aLow     = a(15, 0)
-  private val aHigh    = a(31, 16)
-  private val bLow     = b(15, 0)
-  private val bHigh    = b(31, 16)
-  private val lowLow   = (aLow * bLow).pad(64)
-  private val lowHigh  = ((aLow * bHigh) << 16).pad(64)
-  private val highLow  = ((aHigh * bLow) << 16).pad(64)
-  private val highHigh = ((aHigh * bHigh) << 32).pad(64)
+  /** Collapse every column to at most two bits using a levelized Wallace tree.
+    *
+    * All columns are compressed from the same input snapshot. Carries created
+    * in column k enter only column k+1 in the next level, so no carry can ripple
+    * through an unbounded chain during the tree stage.
+    */
+  private def compressColumns(initial: Seq[Seq[Bool]]): Seq[Seq[Bool]] = {
+    var columns = initial
+    var level = 0
+    while (columns.exists(_.length > 2)) {
+      val next = Array.fill(64)(ArrayBuffer.empty[Bool])
+      for (column <- 0 until 64) {
+        val bits = columns(column)
+        var index = 0
+        while (index + 2 < bits.length) {
+          val (sum, carry) = fullAdder(bits(index), bits(index + 1), bits(index + 2))
+          next(column) += sum
+          if (column + 1 < 64) {
+            next(column + 1) += carry
+          }
+          index += 3
+        }
+        while (index < bits.length) {
+          next(column) += bits(index)
+          index += 1
+        }
+      }
+      columns = next.map(_.toSeq).toSeq
+      level += 1
+      require(level < 64, "Wallace tree failed to converge")
+    }
+    columns
+  }
 
-  // Four rows cannot be reduced to two in one full-adder level. The first CSA
-  // consumes three rows; the second consumes its two outputs plus the fourth.
-  private val (firstSum, firstCarry) = compress3(lowLow, lowHigh, highLow)
-  private val (wallaceSum, wallaceCarry) =
-    compress3(firstSum, firstCarry, highHigh)
+  private def bitAt(bits: Seq[Bool], index: Int): Bool =
+    bits.lift(index).getOrElse(false.B)
+
+  private def packedRow(columns: Seq[Seq[Bool]], index: Int): UInt =
+    Cat(columns.reverse.map(column => bitAt(column, index)))
+
+  // Each a[i]&b[j] is a one-bit convolution term at binary weight i+j.
+  // Partial-product rows are implied by this column representation, avoiding
+  // any embedded 16x16 or 32x32 multiplier primitive.
+  private val partialProductColumns = (0 until 64).map { weight =>
+    (for {
+      aBit <- 0 until 32
+      bBit <- 0 until 32
+      if aBit + bBit == weight
+    } yield a(aBit) & b(bBit)).toSeq
+  }
+
+  private val compressedColumns = compressColumns(partialProductColumns)
+  private val wallaceSum = packedRow(compressedColumns, 0)
+  private val wallaceCarry = packedRow(compressedColumns, 1)
 
   busy := state =/= idle
   done := state === finalAdd
-  product := sumReg + carryReg
+  product := (sumReg +& carryReg)(63, 0)
 
   switch(state) {
     is(idle) {
