@@ -222,6 +222,7 @@ class Core(config: CpuConfig) extends Module {
   // Execution and common data bus
   // -----------------------------------------------------------------------
   val alus = Seq.fill(width)(Module(new Alu))
+  val mulDiv = Module(new MulDivUnit)
   val loadInFlight = RegInit(false.B)
   val loadRobIndex = Reg(UInt(robBits.W))
   val loadSequence = Reg(UInt(32.W))
@@ -230,6 +231,11 @@ class Core(config: CpuConfig) extends Module {
   val loadAddress = Reg(UInt(32.W))
   val loadFunct3 = Reg(UInt(3.W))
   val loadDiscard = RegInit(false.B)
+  val mdRobIndex = Reg(UInt(robBits.W))
+  val mdSequence = Reg(UInt(32.W))
+  val mdPhysDest = Reg(UInt(physBits.W))
+  val mdHasPhysDest = Reg(Bool())
+  val mdDiscard = RegInit(false.B)
 
   val memoryReady = !loadInFlight && dLoadReq.ready
   var pendingStoreFound = false.B
@@ -245,14 +251,15 @@ class Core(config: CpuConfig) extends Module {
     pendingStoreFound = pendingStoreFound || pending
   }
   issueQueue.memoryReady := memoryReady
+  issueQueue.mulDivReady := !mulDiv.busy
   issueQueue.storePending := pendingStoreFound
   issueQueue.oldestStoreSeq := oldestPendingStoreSeq
   issueQueue.enqCommit := false.B // replaced after redirect and capacity are known
 
   val writeback = Wire(
-    Vec(width + 1, Valid(new WritebackEvent(physBits, robBits)))
+    Vec(width + 2, Valid(new WritebackEvent(physBits, robBits)))
   )
-  for (port <- 0 until width + 1) {
+  for (port <- 0 until width + 2) {
     writeback(port) := 0.U.asTypeOf(Valid(new WritebackEvent(physBits, robBits)))
   }
 
@@ -318,7 +325,8 @@ class Core(config: CpuConfig) extends Module {
     val writebackValue =
       Mux(dec.isJal || dec.isJalr, alus(lane).link, result)
 
-    writeback(lane).valid := issueQueue.issue(lane).valid && allowed && !dec.isLoad
+    writeback(lane).valid := issueQueue.issue(lane).valid && allowed &&
+      !dec.isLoad && dec.fu =/= FuType.mulDiv
     writeback(lane).bits.robIndex := entry.robIndex
     writeback(lane).bits.seq := entry.seq
     writeback(lane).bits.hasPhysDest := entry.hasPhysDest
@@ -380,6 +388,47 @@ class Core(config: CpuConfig) extends Module {
   writeback(loadPort).bits.storeData := 0.U
   writeback(loadPort).bits.storeStrobe := 0.U
   issueQueue.writeback := writeback
+
+  val mdPort = width + 1
+  val selectedMd = VecInit((0 until width).map { lane =>
+    issueQueue.issue(lane).valid &&
+      issueQueue.issue(lane).bits.decoded.fu === FuType.mulDiv
+  })
+  mulDiv.start := selectedMd.asUInt.orR
+  mulDiv.op := Mux1H(selectedMd, VecInit((0 until width).map(lane =>
+    issueQueue.issue(lane).bits.decoded.aluOp
+  )))
+  mulDiv.a := Mux1H(selectedMd, VecInit((0 until width).map(lane =>
+    issueQueue.issue(lane).bits.value1
+  )))
+  mulDiv.b := Mux1H(selectedMd, VecInit((0 until width).map(lane =>
+    issueQueue.issue(lane).bits.value2
+  )))
+
+  when(mulDiv.start) {
+    val selectedIndex = PriorityEncoder(selectedMd)
+    mdRobIndex := issueQueue.issue(selectedIndex).bits.robIndex
+    mdSequence := issueQueue.issue(selectedIndex).bits.seq
+    mdPhysDest := issueQueue.issue(selectedIndex).bits.physDest
+    mdHasPhysDest := issueQueue.issue(selectedIndex).bits.hasPhysDest
+    mdDiscard := false.B
+  }
+
+  writeback(mdPort).valid := mulDiv.done && !mdDiscard &&
+    (!redirectNow || mdSequence < redirectSequence)
+  writeback(mdPort).bits.robIndex := mdRobIndex
+  writeback(mdPort).bits.seq := mdSequence
+  writeback(mdPort).bits.hasPhysDest := mdHasPhysDest
+  writeback(mdPort).bits.physDest := mdPhysDest
+  writeback(mdPort).bits.value := mulDiv.value
+  writeback(mdPort).bits.branchTaken := false.B
+  writeback(mdPort).bits.branchTarget := 0.U
+  writeback(mdPort).bits.storeData := 0.U
+  writeback(mdPort).bits.storeStrobe := 0.U
+
+  when(mulDiv.done) {
+    mdDiscard := false.B
+  }
 
   when(dLoadReq.fire) {
     val selectedIndex = PriorityEncoder(selectedLoad)
@@ -465,7 +514,7 @@ class Core(config: CpuConfig) extends Module {
       }
     }
   }
-  for (port <- 0 until width + 1) {
+  for (port <- 0 until width + 2) {
     when(writeback(port).valid) {
       val index = writeback(port).bits.robIndex
       when(rob(index).valid && rob(index).seq === writeback(port).bits.seq) {
@@ -480,7 +529,7 @@ class Core(config: CpuConfig) extends Module {
   }
 
   // PRF writeback.
-  for (port <- 0 until width + 1) {
+  for (port <- 0 until width + 2) {
     when(writeback(port).valid && writeback(port).bits.hasPhysDest) {
       physicalRegisters(writeback(port).bits.physDest) := writeback(port).bits.value
       physicalReady(writeback(port).bits.physDest) := true.B
@@ -542,6 +591,9 @@ class Core(config: CpuConfig) extends Module {
     robTail := (robHead + retainedCount)(robBits - 1, 0)
     when(loadInFlight && !dLoadResp.valid && loadSequence > redirectSequence) {
       loadDiscard := true.B
+    }
+    when(mulDiv.busy && !mulDiv.done && mdSequence > redirectSequence) {
+      mdDiscard := true.B
     }
     if (debugTrace) {
       printf(

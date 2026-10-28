@@ -48,9 +48,10 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
   val enqReady = IO(Output(Bool()))
   val enqCommit = IO(Input(Bool()))
 
-  val writeback = IO(Input(Vec(issueWidth + 1, Valid(new WritebackEvent(physBits, robBits)))))
+  val writeback = IO(Input(Vec(issueWidth + 2, Valid(new WritebackEvent(physBits, robBits)))))
   val issue     = IO(Output(Vec(issueWidth, Valid(new IssueEntry(physBits, robBits)))))
   val memoryReady = IO(Input(Bool()))
+  val mulDivReady = IO(Input(Bool()))
   val storePending = IO(Input(Bool()))
   val oldestStoreSeq = IO(Input(UInt(32.W)))
   val flush     = IO(Input(Valid(UInt(32.W))))
@@ -64,11 +65,11 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
   private val woken = Wire(Vec(depth, new IssueEntry(physBits, robBits)))
   for (i <- 0 until depth) {
     woken(i) := entries(i)
-    val match1 = VecInit((0 until issueWidth + 1).map { port =>
+    val match1 = VecInit((0 until issueWidth + 2).map { port =>
       writeback(port).valid && writeback(port).bits.hasPhysDest &&
         writeback(port).bits.physDest === entries(i).ps1
     })
-    val match2 = VecInit((0 until issueWidth + 1).map { port =>
+    val match2 = VecInit((0 until issueWidth + 2).map { port =>
       writeback(port).valid && writeback(port).bits.hasPhysDest &&
         writeback(port).bits.physDest === entries(i).ps2
     })
@@ -76,14 +77,14 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
       woken(i).rs1Ready := true.B
       woken(i).value1 := Mux1H(
         match1,
-        VecInit((0 until issueWidth + 1).map(port => writeback(port).bits.value))
+        VecInit((0 until issueWidth + 2).map(port => writeback(port).bits.value))
       )
     }
     when(entries(i).valid && !entries(i).rs2Ready && match2.asUInt.orR) {
       woken(i).rs2Ready := true.B
       woken(i).value2 := Mux1H(
         match2,
-        VecInit((0 until issueWidth + 1).map(port => writeback(port).bits.value))
+        VecInit((0 until issueWidth + 2).map(port => writeback(port).bits.value))
       )
     }
   }
@@ -97,6 +98,9 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
   private val loadMask = VecInit((0 until depth).map { i =>
     entries(i).valid && entries(i).decoded.isLoad
   })
+  private val mulDivMask = VecInit((0 until depth).map { i =>
+    entries(i).valid && entries(i).decoded.fu === FuType.mulDiv
+  })
   private val loadBlockedByOlderStore = VecInit((0 until depth).map { i =>
     loadMask(i) && storePending && entries(i).seq > oldestStoreSeq
   }).asUInt
@@ -106,14 +110,18 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
 
   private var selectedMask = 0.U(depth.W)
   private var memorySelected = false.B
+  private var mulDivSelected = false.B
   private var controlSelected = false.B
 
   for (lane <- 0 until issueWidth) {
     val memoryBlocked =
       if (lane == 0) !memoryReady else memorySelected || !memoryReady
+    val mulDivBlocked =
+      if (lane == 0) !mulDivReady else mulDivSelected || !mulDivReady
     val afterControl = if (lane == 0) false.B else controlSelected
     val candidates = eligible.asUInt & ~selectedMask &
       Mux(memoryBlocked, ~memoryMask.asUInt, Fill(depth, true.B)) &
+      Mux(mulDivBlocked, ~mulDivMask.asUInt, Fill(depth, true.B)) &
       ~loadBlockedByOlderStore &
       Mux(afterControl, 0.U(depth.W), Fill(depth, true.B))
 
@@ -126,6 +134,7 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
       Mux(found, entries(index), 0.U.asTypeOf(new IssueEntry(physBits, robBits)))
 
     memorySelected = memorySelected || (found && memoryMask(index))
+    mulDivSelected = mulDivSelected || (found && mulDivMask(index))
     controlSelected = controlSelected || (found && controlMask(index))
     selectedMask = selectedMask | chosen
   }
@@ -146,11 +155,11 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
   )
   for (lane <- 0 until issueWidth) {
     resolvedEnqueue(lane) := enq(lane)
-    val source1Matches = VecInit((0 until issueWidth + 1).map { port =>
+    val source1Matches = VecInit((0 until issueWidth + 2).map { port =>
       writeback(port).valid && writeback(port).bits.hasPhysDest &&
         writeback(port).bits.physDest === enq(lane).ps1
     })
-    val source2Matches = VecInit((0 until issueWidth + 1).map { port =>
+    val source2Matches = VecInit((0 until issueWidth + 2).map { port =>
       writeback(port).valid && writeback(port).bits.hasPhysDest &&
         writeback(port).bits.physDest === enq(lane).ps2
     })
@@ -158,14 +167,14 @@ class IssueQueue(issueWidth: Int, depth: Int, physRegs: Int, robDepth: Int) exte
       resolvedEnqueue(lane).rs1Ready := true.B
       resolvedEnqueue(lane).value1 := Mux1H(
         source1Matches,
-        VecInit((0 until issueWidth + 1).map(port => writeback(port).bits.value))
+        VecInit((0 until issueWidth + 2).map(port => writeback(port).bits.value))
       )
     }
     when(!enq(lane).rs2Ready && source2Matches.asUInt.orR) {
       resolvedEnqueue(lane).rs2Ready := true.B
       resolvedEnqueue(lane).value2 := Mux1H(
         source2Matches,
-        VecInit((0 until issueWidth + 1).map(port => writeback(port).bits.value))
+        VecInit((0 until issueWidth + 2).map(port => writeback(port).bits.value))
       )
     }
   }

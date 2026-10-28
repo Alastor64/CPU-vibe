@@ -4,8 +4,9 @@ import chisel3._
 import chisel3.util._
 
 object FuType {
-  val alu = 0.U(1.W)
-  val mem = 1.U(1.W)
+  val alu = 0.U(2.W)
+  val mulDiv = 1.U(2.W)
+  val mem = 2.U(2.W)
 }
 
 object AluOp {
@@ -62,7 +63,7 @@ class Decoded extends Bundle {
   val rs2      = UInt(5.W)
   val rd       = UInt(5.W)
   val imm      = UInt(32.W)
-  val fu       = UInt(1.W)
+  val fu       = UInt(2.W)
   val aluOp    = UInt(5.W)
   val op1Sel   = UInt(2.W)
   val op2Sel   = UInt(2.W)
@@ -268,6 +269,7 @@ class Decoder extends Module {
     is("h33".U) { // OP
       decoded.illegal := false.B
       when(funct7 === "h01".U) {
+        decoded.fu := FuType.mulDiv
         decoded.aluOp := MuxLookup(funct3, AluOp.mul)(
           Seq(
             "b000".U -> AluOp.mul,
@@ -327,18 +329,6 @@ class Alu extends Module {
   val redirect   = IO(Output(Bool()))
 
   private val shamt = b(4, 0)
-  private val unsignedProduct = a * b
-  private val signedProduct = a.asSInt * b.asSInt
-  private val signedUnsignedProduct =
-    (a.asSInt.pad(64) * b.pad(64).asSInt).asUInt
-
-  private val divByZero = b === 0.U
-  private val signedOverflow = a === "h80000000".U && b === "hffffffff".U
-  private val signedQuotient = a.asSInt / b.asSInt
-  private val signedRemainder = a.asSInt % b.asSInt
-  private val unsignedQuotient = a / b
-  private val unsignedRemainder = a % b
-
   result := MuxLookup(op, 0.U)(
     Seq(
       AluOp.add -> (a + b),
@@ -350,15 +340,7 @@ class Alu extends Module {
       AluOp.srl -> (a >> shamt),
       AluOp.sra -> (a.asSInt >> shamt).asUInt,
       AluOp.or -> (a | b),
-      AluOp.and -> (a & b),
-      AluOp.mul -> unsignedProduct(31, 0),
-      AluOp.mulh -> signedProduct.asUInt(63, 32),
-      AluOp.mulhsu -> signedUnsignedProduct(63, 32),
-      AluOp.mulhu -> unsignedProduct(63, 32),
-      AluOp.div -> Mux(divByZero, "hffffffff".U, Mux(signedOverflow, a, signedQuotient.asUInt)),
-      AluOp.divu -> Mux(divByZero, "hffffffff".U, unsignedQuotient),
-      AluOp.rem -> Mux(divByZero, a, Mux(signedOverflow, 0.U, signedRemainder.asUInt)),
-      AluOp.remu -> Mux(divByZero, a, unsignedRemainder)
+      AluOp.and -> (a & b)
     )
   )
 

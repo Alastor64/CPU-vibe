@@ -48,3 +48,7 @@ SRAM 化，并通过多端口或 banking 恢复访存吞吐。
 
 `feature/sram-instruction-cache` 进一步把 I-Cache 行数据迁移到 `sram_fakeram`，并用
 单行缓冲保持多字取指。最终配置再次通过官方正确性 19/19，GEOMEAN 为 0.2274。
+
+`feature/shared-muldiv` 将 4 份组合乘除逻辑压缩为一个共享 M 扩展单元。乘法延迟
+2 拍，除法/取余延迟 34 拍，官方正确性 19/19 和完整 ISA 定向测试通过。除法密集型
+程序周期数明显增加，后续通过 radix-4/8 迭代或更高基数的共享除法器恢复吞吐。

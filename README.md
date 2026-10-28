@@ -59,8 +59,8 @@ make generate ISSUE_WIDTH=2 ROB_DEPTH=32 PHYSICAL_REGISTERS=96 \
 - 官方正确性测试：19/19 通过。
 - 官方性能测试：6/6 能正确退出。
 - 1、2、4 发射均已完成 Chisel elaboration 和 Verilator 编译。
-- I/D Cache 的行存储均已迁移到 `sram_fakeram`。组合逻辑乘除法和多端口数据访问
-  仍是下一阶段优化重点。
+- I/D Cache 的行存储均已迁移到 `sram_fakeram`。多端口数据访问仍是下一阶段优化重点。
+- 四个执行通道共享一个 M 扩展单元：乘法固定 2 拍，除法/取余 radix-2 迭代 34 拍。
 
 ## 验证约定
 
