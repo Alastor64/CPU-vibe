@@ -59,8 +59,8 @@ make generate ISSUE_WIDTH=2 ROB_DEPTH=32 PHYSICAL_REGISTERS=96 \
 - 官方正确性测试：19/19 通过。
 - 官方性能测试：6/6 能正确退出。
 - 1、2、4 发射均已完成 Chisel elaboration 和 Verilator 编译。
-- 当前组合逻辑乘法、除法，以及由寄存器阵列实现的 Cache 仍会显著增加面积；
-  Cache 的 `sram_fakeram` 化和多端口数据访问是下一阶段优化重点。
+- 数据 Cache 的行存储已迁移到 `sram_fakeram`；指令 Cache 仍使用寄存器阵列。
+  组合逻辑乘除法、指令 Cache 的 SRAM 化和多端口数据访问是下一阶段优化重点。
 
 ## 验证约定
 

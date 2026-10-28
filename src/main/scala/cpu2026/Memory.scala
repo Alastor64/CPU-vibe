@@ -15,6 +15,31 @@ class WriteResponse extends Bundle {
   val isExit = Bool()
 }
 
+/** Course-provided synchronous single-port SRAM. */
+class Sram(depth: Int, width: Int, writeGranularity: Int) extends ExtModule(
+  Map(
+    "DEPTH" -> IntParam(depth),
+    "WIDTH" -> IntParam(width),
+    "WRITE_GRANULARITY" -> IntParam(writeGranularity)
+  )
+) {
+  require(depth >= 1 && depth <= 1048576)
+  require(width >= 1 && width <= 4096)
+  require(depth.toLong * width <= 16777216L)
+  require(writeGranularity >= 1 && writeGranularity <= width)
+  require(width % writeGranularity == 0)
+
+  override def desiredName: String = "sram_fakeram"
+
+  val clk = IO(Input(Clock()))
+  val en = IO(Input(Bool()))
+  val we = IO(Input(Bool()))
+  val wmask = IO(Input(UInt((width / writeGranularity).W)))
+  val addr = IO(Input(UInt(math.max(1, log2Ceil(depth)).W)))
+  val wdata = IO(Input(UInt(width.W)))
+  val rdata = IO(Output(UInt(width.W)))
+}
+
 /** Serial AXI4-Lite read engine shared by the instruction and data caches.
   *
   * AXI preserves the order of read responses. Keeping one read in flight avoids
@@ -258,6 +283,7 @@ class InstructionCache(config: CpuConfig, fetchWidth: Int) extends Module {
 
 class DataCache(config: CpuConfig) extends Module {
   require(config.cacheLineBytes % 4 == 0)
+  private val debugTrace = sys.env.get("CPU_DEBUG").contains("1")
 
   val loadReq  = IO(Flipped(Decoupled(UInt(32.W))))
   val loadResp = IO(Valid(UInt(32.W)))
@@ -277,19 +303,39 @@ class DataCache(config: CpuConfig) extends Module {
   private val indexBits = log2Ceil(sets)
   private val offsetBits = log2Ceil(config.cacheLineBytes)
   private val tagBits = 32 - indexBits - offsetBits
+  private val lineBits = lineWords * 32
+  private val lineCount = sets * ways
 
-  val lines = Reg(Vec(sets, Vec(ways, new CacheLine(tagBits, lineWords))))
+  val lineSram = Module(new Sram(lineCount, lineBits, lineBits))
   val valid = RegInit(VecInit(Seq.fill(sets)(VecInit(Seq.fill(ways)(false.B)))))
+  val tags = Reg(Vec(sets, Vec(ways, UInt(tagBits.W))))
 
-  private val idle :: fillAddrState :: fillDataState :: fillDrain :: Nil = Enum(4)
+  private val states = Enum(10)
+  private val idle = states(0)
+  private val readLoad = states(1)
+  private val readLoadWait = states(2)
+  private val readStore = states(3)
+  private val readStoreWait = states(4)
+  private val storeWrite = states(5)
+  private val fillDrain = states(6)
+  private val fillAddrState = states(7)
+  private val fillDataState = states(8)
+  private val fillWrite = states(9)
   val state = RegInit(idle)
   val fillAddress = Reg(UInt(32.W))
   val fillTag = Reg(UInt(tagBits.W))
   val fillSet = Reg(UInt(indexBits.W))
   val fillWay = Reg(UInt(log2Ceil(ways).W))
   val fillWord = Reg(UInt(log2Ceil(lineWords).W))
+  val fillLineData = Reg(Vec(lineWords, UInt(32.W)))
   val requestedIndex = Reg(UInt(log2Ceil(lineWords).W))
   val requestedData = Reg(UInt(32.W))
+  val pendingLoadWord = Reg(UInt(log2Ceil(lineWords).W))
+  val pendingLoadSramAddr = Reg(UInt(math.max(1, log2Ceil(lineCount)).W))
+  val pendingStore = Reg(new StoreRequest)
+  val pendingStoreWord = Reg(UInt(log2Ceil(lineWords).W))
+  val pendingStoreSramAddr = Reg(UInt(math.max(1, log2Ceil(lineCount)).W))
+  val pendingStoreLine = Reg(Vec(lineWords, UInt(32.W)))
   val loadResponseValid = RegInit(false.B)
   val loadResponseData = Reg(UInt(32.W))
   val storeResponse = RegInit(0.U.asTypeOf(Valid(UInt(2.W))))
@@ -308,7 +354,7 @@ class DataCache(config: CpuConfig) extends Module {
   private val loadTag = if (tagBits == 0) 0.U else loadAddress >> (offsetBits + indexBits)
   private val loadWord = (loadAddress >> 2)(log2Ceil(lineWords) - 1, 0)
   private val loadHitVec = VecInit((0 until ways).map { way =>
-    valid(loadSet)(way) && lines(loadSet)(way).tag === loadTag
+    valid(loadSet)(way) && tags(loadSet)(way) === loadTag
   })
   private val loadHit = loadHitVec.asUInt.orR
 
@@ -317,7 +363,7 @@ class DataCache(config: CpuConfig) extends Module {
   private val storeTag = if (tagBits == 0) 0.U else storeAddress >> (offsetBits + indexBits)
   private val storeWord = (storeAddress >> 2)(log2Ceil(lineWords) - 1, 0)
   private val storeHitVec = VecInit((0 until ways).map { way =>
-    valid(storeSet)(way) && lines(storeSet)(way).tag === storeTag
+    valid(storeSet)(way) && tags(storeSet)(way) === storeTag
   })
 
   private val emptyVec = VecInit((0 until ways).map(way => !valid(loadSet)(way)))
@@ -332,6 +378,30 @@ class DataCache(config: CpuConfig) extends Module {
   writeReq.bits := writeQueue.io.deq.bits
   writeQueue.io.deq.ready := writeReq.ready
 
+  val readWords = VecInit((0 until lineWords).map { word =>
+    lineSram.rdata(word * 32 + 31, word * 32)
+  })
+  lineSram.clk := clock
+  lineSram.en := state === readLoad || state === readStore ||
+    state === fillWrite || state === storeWrite
+  lineSram.we := state === fillWrite || state === storeWrite
+  lineSram.wmask := true.B
+  lineSram.addr := MuxLookup(state, 0.U)(
+    Seq(
+      readLoad -> pendingLoadSramAddr,
+      readStore -> pendingStoreSramAddr,
+      storeWrite -> pendingStoreSramAddr,
+      fillWrite -> (fillSet * ways.U + fillWay)
+    )
+  )
+  lineSram.wdata := Cat((0 until lineWords).reverse.map { word =>
+    Mux(
+      state === storeWrite,
+      pendingStoreLine(word),
+      fillLineData(word)
+    )
+  })
+
   when(loadResponseValid) {
     loadResponseValid := false.B
   }
@@ -343,11 +413,16 @@ class DataCache(config: CpuConfig) extends Module {
   loadResp.bits := loadResponseData
 
   when(loadReq.fire) {
+    if (debugTrace) {
+      printf(
+        p"DLOAD_REQ addr=${loadAddress} hit=${loadHit} set=${loadSet} " +
+          p"tag=${loadTag} word=${loadWord}\n"
+      )
+    }
     when(loadHit) {
-      loadResponseValid := true.B
-      loadResponseData := Mux1H(loadHitVec, VecInit((0 until ways).map { way =>
-        lines(loadSet)(way).data(loadWord)
-      }))
+      pendingLoadWord := loadWord
+      pendingLoadSramAddr := loadSet * ways.U + OHToUInt(loadHitVec)
+      state := readLoad
     }.otherwise {
       fillAddress := lineBase
       fillTag := loadTag
@@ -363,6 +438,19 @@ class DataCache(config: CpuConfig) extends Module {
     }
   }
 
+  when(state === readLoad) {
+    state := readLoadWait
+  }
+
+  when(state === readLoadWait) {
+    loadResponseValid := true.B
+    loadResponseData := readWords(pendingLoadWord)
+    if (debugTrace) {
+      printf(p"DLOAD_RESP word=${pendingLoadWord} data=${readWords(pendingLoadWord)}\n")
+    }
+    state := idle
+  }
+
   when(state === fillDrain && writeQueue.io.count === 0.U && writeIdle) {
     state := fillAddrState
   }
@@ -372,16 +460,19 @@ class DataCache(config: CpuConfig) extends Module {
   }
 
   when(state === fillDataState && memResp.valid) {
-    lines(fillSet)(fillWay).data(fillWord) := memResp.bits
+    if (debugTrace) {
+      printf(
+        p"DFILL addr=${fillAddress} word=${fillWord} data=${memResp.bits}\n"
+      )
+    }
+    fillLineData(fillWord) := memResp.bits
     when(fillWord === requestedIndex) {
       requestedData := memResp.bits
     }
     when(fillWord === (lineWords - 1).U) {
-      lines(fillSet)(fillWay).tag := fillTag
+      tags(fillSet)(fillWay) := fillTag
       valid(fillSet)(fillWay) := true.B
-      loadResponseValid := true.B
-      loadResponseData := Mux(fillWord === requestedIndex, memResp.bits, requestedData)
-      state := idle
+      state := fillWrite
     }.otherwise {
       fillAddress := fillAddress + 4.U
       fillWord := fillWord + 1.U
@@ -389,26 +480,62 @@ class DataCache(config: CpuConfig) extends Module {
     }
   }
 
+  when(state === fillWrite) {
+    loadResponseValid := true.B
+    loadResponseData := Mux(
+      requestedIndex === (lineWords - 1).U,
+      fillLineData(lineWords - 1),
+      requestedData
+    )
+    state := idle
+    if (debugTrace) {
+      printf(
+        p"DFILL_DONE set=${fillSet} way=${fillWay} tag=${fillTag} " +
+          p"requested=${requestedIndex} data=${loadResponseData}\n"
+      )
+    }
+  }
+
   when(storeReq.fire) {
+    pendingStore := storeReq.bits
     when(storeHitVec.asUInt.orR) {
-      for (way <- 0 until ways) {
-        when(storeHitVec(way)) {
-          val oldWord = lines(storeSet)(way).data(storeWord)
-          val merged = Cat((0 until 4).reverse.map { byte =>
-            Mux(
-              storeReq.bits.strobe(byte),
-              storeReq.bits.data(byte * 8 + 7, byte * 8),
-              oldWord(byte * 8 + 7, byte * 8)
-            )
-          })
-          lines(storeSet)(way).data(storeWord) := merged
-        }
+      pendingStoreWord := storeWord
+      pendingStoreSramAddr := storeSet * ways.U + OHToUInt(storeHitVec)
+      state := readStore
+    }.otherwise {
+      when(!storeReq.bits.isExit) {
+        storeResponse.valid := true.B
+        storeResponse.bits := 0.U
       }
     }
-    when(!storeReq.bits.isExit) {
+  }
+
+  when(state === readStore) {
+    state := readStoreWait
+  }
+
+  when(state === readStoreWait) {
+    val oldWord = readWords(pendingStoreWord)
+    val merged = Cat((0 until 4).reverse.map { byte =>
+      Mux(
+        pendingStore.strobe(byte),
+        pendingStore.data(byte * 8 + 7, byte * 8),
+        oldWord(byte * 8 + 7, byte * 8)
+      )
+    })
+    for (word <- 0 until lineWords) {
+      pendingStoreLine(word) := readWords(word)
+    }
+    pendingStoreLine(pendingStoreWord) := merged
+    state := storeWrite
+  }
+
+  when(state === storeWrite) {
+    when(!pendingStore.isExit) {
       storeResponse.valid := true.B
       storeResponse.bits := 0.U
     }
+    state := idle
   }
 
   when(writeResp.valid && writeResp.bits.isExit) {

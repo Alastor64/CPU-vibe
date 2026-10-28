@@ -38,3 +38,10 @@ Results: 19 passed, 0 failed
 
 32 KiB D-Cache 将 GEOMEAN 提升到约 0.358，但综合未收敛，暂不作为提交默认值。
 后续必须完成 SRAM 化 Cache 和多端口数据访问后再优化 IPC/面积/频率。
+
+## 数据 Cache SRAM 化
+
+`feature/sram-data-cache` 将 D-Cache 行数据迁移到课程 `sram_fakeram`，保留标签和有效位
+寄存器。该配置同样通过官方正确性 19/19 和完整 ISA 定向测试。同步 SRAM 增加了一级
+读延迟，当前 GEOMEAN 为 0.2279，略低于寄存器阵列版本；下一步需要将 I-Cache 也
+SRAM 化，并通过多端口或 banking 恢复访存吞吐。
