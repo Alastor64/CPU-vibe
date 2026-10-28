@@ -37,16 +37,21 @@ class MulDivUnit extends Module {
     op === AluOp.mulhsu || op === AluOp.mulhu
   val isSignedDiv = op === AluOp.div || op === AluOp.rem
 
+  // One unsigned array is sufficient for every RV32M multiply:
+  // low 32 bits are sign-agnostic, and signed high halves are corrected by
+  // subtracting the other operand when either source sign bit is set.
   private val unsignedProduct = a * b
-  private val signedProduct = a.asSInt * b.asSInt
-  private val signedUnsignedProduct =
-    (a.asSInt.pad(64) * b.pad(64).asSInt).asUInt
+  private val unsignedHigh = unsignedProduct(63, 32)
+  private val signedSignedHigh =
+    unsignedHigh - Mux(a(31), b, 0.U) - Mux(b(31), a, 0.U)
+  private val signedUnsignedHigh =
+    unsignedHigh - Mux(a(31), b, 0.U)
   val multiplyValue = MuxLookup(op, 0.U)(
     Seq(
       AluOp.mul -> unsignedProduct(31, 0),
-      AluOp.mulh -> signedProduct.asUInt(63, 32),
-      AluOp.mulhsu -> signedUnsignedProduct(63, 32),
-      AluOp.mulhu -> unsignedProduct(63, 32)
+      AluOp.mulh -> signedSignedHigh,
+      AluOp.mulhsu -> signedUnsignedHigh,
+      AluOp.mulhu -> unsignedHigh
     )
   )
 
