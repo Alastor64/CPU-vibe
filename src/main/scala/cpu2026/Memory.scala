@@ -173,6 +173,7 @@ class CacheLine(tagWidth: Int, lineWords: Int) extends Bundle {
 class InstructionCache(config: CpuConfig, fetchWidth: Int) extends Module {
   require(config.cacheLineBytes % 4 == 0)
   require(fetchWidth >= 1 && fetchWidth <= 4)
+  private val debugTrace = sys.env.get("CPU_DEBUG").contains("1")
 
   val pc = IO(Input(UInt(32.W)))
   val instrs = IO(Output(Vec(fetchWidth, UInt(32.W))))
@@ -189,78 +190,136 @@ class InstructionCache(config: CpuConfig, fetchWidth: Int) extends Module {
   private val indexBits = log2Ceil(sets)
   private val offsetBits = log2Ceil(config.cacheLineBytes)
   private val tagBits = 32 - indexBits - offsetBits
+  private val lineBits = lineWords * 32
+  private val lineCount = sets * ways
+  private val lineAddrBits = math.max(1, log2Ceil(lineCount))
 
-  val lines = Reg(Vec(sets, Vec(ways, new CacheLine(tagBits, lineWords))))
+  val lineSram = Module(new Sram(lineCount, lineBits, lineBits))
   val valid = RegInit(VecInit(Seq.fill(sets)(VecInit(Seq.fill(ways)(false.B)))))
+  val tags = Reg(Vec(sets, Vec(ways, UInt(tagBits.W))))
 
-  private val idle :: fillAddrState :: fillDataState :: Nil = Enum(3)
+  private val states = Enum(6)
+  private val idle = states(0)
+  private val readLineState = states(1)
+  private val readLineWait = states(2)
+  private val fillAddrState = states(3)
+  private val fillDataState = states(4)
+  private val fillWrite = states(5)
   val state = RegInit(idle)
   val fillAddress = Reg(UInt(32.W))
   val fillTag = Reg(UInt(tagBits.W))
   val fillSet = Reg(UInt(indexBits.W))
   val fillWay = Reg(UInt(log2Ceil(ways).W))
   val fillWord = Reg(UInt(log2Ceil(lineWords).W))
+  val fillLineData = Reg(Vec(lineWords, UInt(32.W)))
 
-  private val requestAddrs = VecInit((0 until fetchWidth).map { lane =>
-    pc + (lane * 4).U
-  })
-  private val setIndexes = VecInit(requestAddrs.map { address =>
-    (address >> offsetBits)(indexBits - 1, 0)
-  })
-  private val tags = VecInit(requestAddrs.map { address =>
-    if (tagBits == 0) 0.U else address >> (offsetBits + indexBits)
-  })
-  private val wordIndexes = VecInit(requestAddrs.map { address =>
-    (address >> 2)(log2Ceil(lineWords) - 1, 0)
-  })
-  private val hitVectors = VecInit((0 until fetchWidth).map { lane =>
-    VecInit((0 until ways).map { way =>
-      valid(setIndexes(lane))(way) && lines(setIndexes(lane))(way).tag === tags(lane)
-    })
-  })
-  private val laneHits = VecInit(hitVectors.map(_.asUInt.orR))
-  private val laneData = VecInit((0 until fetchWidth).map { lane =>
-    Mux1H(
-      hitVectors(lane),
-      VecInit((0 until ways).map { way =>
-        lines(setIndexes(lane))(way).data(wordIndexes(lane))
-      })
-    )
-  })
-  private val prefixHits = VecInit((0 until fetchWidth).map { lane =>
-    (0 to lane).map(index => laneHits(index)).reduce(_ && _)
-  })
-  private val validLanes = Mux(
-    state === idle,
-    prefixHits,
-    VecInit(Seq.fill(fetchWidth)(false.B))
-  )
-  count := PopCount(validLanes)
-  instrs := laneData
+  val lineBuffer = Reg(Vec(lineWords, UInt(32.W)))
+  val lineBufferValid = RegInit(false.B)
+  val lineBufferBase = Reg(UInt(32.W))
 
-  private val missLanes = VecInit((0 until fetchWidth).map(lane => !laneHits(lane)))
-  private val firstMiss = PriorityEncoder(missLanes)
-  private val firstMissAddress = requestAddrs(firstMiss)
-  private val lineBase = Cat(firstMissAddress(31, offsetBits), 0.U(offsetBits.W))
-  private val emptyVec = VecInit((0 until ways).map { way =>
-    !valid(setIndexes(firstMiss))(way)
+  val readLineBase = Reg(UInt(32.W))
+  val readTag = Reg(UInt(tagBits.W))
+  val readSet = Reg(UInt(indexBits.W))
+  val readWay = Reg(UInt(log2Ceil(ways).W))
+  val readWord = Reg(UInt(log2Ceil(lineWords).W))
+
+  private val requestBase = Cat(pc(31, offsetBits), 0.U(offsetBits.W))
+  private val requestSet = (pc >> offsetBits)(indexBits - 1, 0)
+  private val requestTag = if (tagBits == 0) 0.U else pc >> (offsetBits + indexBits)
+  private val requestWord = (pc >> 2)(log2Ceil(lineWords) - 1, 0)
+  private val hitVec = VecInit((0 until ways).map { way =>
+    valid(requestSet)(way) && tags(requestSet)(way) === requestTag
   })
+  private val cacheHit = hitVec.asUInt.orR
+  private val emptyVec = VecInit((0 until ways).map { way => !valid(requestSet)(way) })
   private val victim = Mux(emptyVec.asUInt.orR, PriorityEncoder(emptyVec), 0.U)
+
+  val readWords = VecInit((0 until lineWords).map { word =>
+    lineSram.rdata(word * 32 + 31, word * 32)
+  })
+  val bufferHit = state === idle && lineBufferValid && lineBufferBase === requestBase
+  val outputFromSram = state === readLineWait
+  val outputFromFill = state === fillWrite
+  val outputActive = bufferHit || outputFromSram || outputFromFill
+
+  val activeWords = Mux(
+    outputFromFill,
+    fillLineData,
+    Mux(outputFromSram, readWords, lineBuffer)
+  )
+  val activeWord = Mux(
+    outputFromFill,
+    readWord,
+    Mux(outputFromSram, readWord, requestWord)
+  )
+  val remainingWords = lineWords.U - activeWord
+  val validLanes = VecInit((0 until fetchWidth).map { lane =>
+    outputActive && lane.U < remainingWords
+  })
+  count := PopCount(validLanes)
+  instrs := VecInit((0 until fetchWidth).map { lane =>
+    activeWords((activeWord + lane.U)(log2Ceil(lineWords) - 1, 0))
+  })
+
+  lineSram.clk := clock
+  lineSram.en := state === readLineState || state === fillWrite
+  lineSram.we := state === fillWrite
+  lineSram.wmask := true.B
+  lineSram.addr := Mux(
+    state === readLineState,
+    readSet * ways.U + readWay,
+    fillSet * ways.U + fillWay
+  )
+  lineSram.wdata := Cat((0 until lineWords).reverse.map(fillLineData(_)))
 
   memReq.valid := state === fillAddrState
   memReq.bits := fillAddress
 
-  when(flush) {
-    state := idle
+  when(state === idle && !bufferHit) {
+    when(cacheHit) {
+      readLineBase := requestBase
+      readTag := requestTag
+      readSet := requestSet
+      readWay := OHToUInt(hitVec)
+      readWord := requestWord
+      state := readLineState
+      if (debugTrace) {
+        printf(
+          p"IREAD_START base=${requestBase} set=${requestSet} " +
+            p"tag=${requestTag} way=${OHToUInt(hitVec)}\n"
+        )
+      }
+    }.otherwise {
+      fillAddress := requestBase
+      fillTag := requestTag
+      fillSet := requestSet
+      fillWay := victim
+      fillWord := 0.U
+      readLineBase := requestBase
+      readTag := requestTag
+      readWord := requestWord
+      state := fillAddrState
+      if (debugTrace) {
+        printf(
+          p"IFILL_START base=${requestBase} set=${requestSet} " +
+            p"tag=${requestTag} way=${victim}\n"
+        )
+      }
+    }
   }
 
-  when(state === idle && missLanes.asUInt.orR) {
-    fillAddress := lineBase
-    fillTag := tags(firstMiss)
-    fillSet := setIndexes(firstMiss)
-    fillWay := victim
-    fillWord := 0.U
-    state := fillAddrState
+  when(state === readLineState) {
+    state := readLineWait
+  }
+
+  when(state === readLineWait) {
+    lineBuffer := readWords
+    lineBufferValid := true.B
+    lineBufferBase := readLineBase
+    state := idle
+    if (debugTrace) {
+      printf(p"IREAD_DONE base=${readLineBase} word0=${readWords(0)}\n")
+    }
   }
 
   when(state === fillAddrState && memReq.ready) {
@@ -268,16 +327,32 @@ class InstructionCache(config: CpuConfig, fetchWidth: Int) extends Module {
   }
 
   when(state === fillDataState && memResp.valid) {
-    lines(fillSet)(fillWay).data(fillWord) := memResp.bits
+    fillLineData(fillWord) := memResp.bits
     when(fillWord === (lineWords - 1).U) {
-      lines(fillSet)(fillWay).tag := fillTag
-      valid(fillSet)(fillWay) := true.B
-      state := idle
+      state := fillWrite
     }.otherwise {
       fillAddress := fillAddress + 4.U
       fillWord := fillWord + 1.U
       state := fillAddrState
     }
+  }
+
+  when(state === fillWrite) {
+    tags(fillSet)(fillWay) := fillTag
+    valid(fillSet)(fillWay) := true.B
+    lineBuffer := fillLineData
+    lineBufferValid := true.B
+    lineBufferBase := readLineBase
+    state := idle
+    if (debugTrace) {
+      printf(p"IFILL_DONE base=${readLineBase} word0=${fillLineData(0)}\n")
+    }
+  }
+
+  // Redirects have highest priority. This must remain the last state
+  // assignment so a request started with the stale PC cannot survive redirect.
+  when(flush) {
+    state := idle
   }
 }
 

@@ -45,3 +45,6 @@ Results: 19 passed, 0 failed
 寄存器。该配置同样通过官方正确性 19/19 和完整 ISA 定向测试。同步 SRAM 增加了一级
 读延迟，当前 GEOMEAN 为 0.2279，略低于寄存器阵列版本；下一步需要将 I-Cache 也
 SRAM 化，并通过多端口或 banking 恢复访存吞吐。
+
+`feature/sram-instruction-cache` 进一步把 I-Cache 行数据迁移到 `sram_fakeram`，并用
+单行缓冲保持多字取指。最终配置再次通过官方正确性 19/19，GEOMEAN 为 0.2274。
